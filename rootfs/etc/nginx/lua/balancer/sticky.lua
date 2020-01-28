@@ -1,7 +1,9 @@
 local balancer_resty = require("balancer.resty")
 local ck = require("resty.cookie")
+local resty_chash = require("resty.chash")
 local ngx_balancer = require("ngx.balancer")
 local split = require("util.split")
+local util = require("util")
 
 local _M = balancer_resty:new()
 local DEFAULT_COOKIE_NAME = "route"
@@ -12,6 +14,7 @@ end
 
 function _M.new(self)
   local o = {
+    chash = nil,
     alternative_backends = nil,
     cookie_session_affinity = nil,
     traffic_shaping_policy = nil
@@ -111,29 +114,58 @@ local function should_set_cookie(self)
   return false
 end
 
+local function should_change_upstream(self)
+  return self.cookie_session_affinity.change_on_failure and self.get_last_failure() ~= nil
+end
+
+local function can_use_upstream(self, upstream, failed_upstreams)
+  return upstream ~= nil and not should_change_upstream(self) and not failed_upstreams[upstream]
+end
+
 function _M.balance(self)
-  local upstream_from_cookie
+  local failed_upstreams = get_failed_upstreams()
 
-  local key = self:get_cookie()
-  if key then
-    upstream_from_cookie = self.instance:find(key)
+  local cookie_val = self:get_cookie()
+  if cookie_val then
+    local upstream_from_cookie = self.instance:find(cookie_val)
+    if can_use_upstream(self, upstream_from_cookie, failed_upstreams) then
+      return upstream_from_cookie
+    end
   end
 
-  local last_failure = self.get_last_failure()
-  local should_pick_new_upstream = last_failure ~= nil and self.cookie_session_affinity.change_on_failure or
-    upstream_from_cookie == nil
+  -- balancing by client IP is working only in 'persistent' mode currently
+  if self.instance.map then -- is 'persistent' mode?
+    local headers = ngx.req.get_headers()
+    local real_ip = ngx.var.remote_addr
+    for _, name in ipairs({ 'x-forwarded-for', 'x-real-ip', 'cf-connecting-ip' }) do
+      if headers[name] then
+        real_ip = headers[name]
+        break
+      end
+    end
 
-  if not should_pick_new_upstream then
-    return upstream_from_cookie
+    local req_key = (real_ip or '') .. "\t" .. (headers["user-agent"] or '')
+    local upstream_from_request = self.chash:find(req_key)
+    if can_use_upstream(self, upstream_from_request, failed_upstreams) then
+      local hash
+      for key, endpoint in pairs(self.instance.map) do
+        if endpoint == upstream_from_request then
+          hash = key
+          break
+        end
+      end
+      if hash and should_set_cookie(self) then
+        self:set_cookie(hash)
+      end
+      return upstream_from_request
+    end
   end
 
-  local new_upstream
-
-  new_upstream, key = self:pick_new_upstream(get_failed_upstreams())
+  local new_upstream, hash = self:pick_new_upstream(failed_upstreams)
   if not new_upstream then
     ngx.log(ngx.WARN, string.format("failed to get new upstream; using upstream %s", new_upstream))
   elseif should_set_cookie(self) then
-    self:set_cookie(key)
+    self:set_cookie(hash)
   end
 
   return new_upstream
@@ -146,6 +178,7 @@ function _M.sync(self, backend)
   self.traffic_shaping_policy = backend.trafficShapingPolicy
   self.alternative_backends = backend.alternativeBackends
   self.cookie_session_affinity = backend.sessionAffinityConfig.cookieSessionAffinity
+  self.chash = resty_chash:new(util.get_nodes(backend.endpoints))
 end
 
 return _M
