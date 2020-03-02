@@ -119,7 +119,40 @@ local function should_change_upstream(self)
 end
 
 local function can_use_upstream(self, upstream, failed_upstreams)
-  return upstream ~= nil and not should_change_upstream(self) and not failed_upstreams[upstream]
+  return upstream and not should_change_upstream(self) and not failed_upstreams[upstream]
+end
+
+local function get_param(name)
+  local cookie_name = name
+  local query_param_name = name
+  local header_name = 'x-' .. name
+  local value = ''
+
+  local cookie = ck:new()
+  if cookie then
+    value = cookie:get(cookie_name)
+    if value then
+      return value
+    end
+  end
+
+  local query_params = ngx.req.get_uri_args()
+  if query_params then
+    value = query_params[query_param_name]
+    if value then
+      return value
+    end
+  end
+
+  local headers = ngx.req.get_headers()
+  if headers then
+    value = headers[header_name]
+    if value then
+      return value
+    end
+  end
+
+  return ''
 end
 
 function _M.balance(self)
@@ -127,14 +160,27 @@ function _M.balance(self)
 
   local cookie_val = self:get_cookie()
   if cookie_val then
-    local upstream_from_cookie = self.instance:find(cookie_val)
-    if can_use_upstream(self, upstream_from_cookie, failed_upstreams) then
-      return upstream_from_cookie
+    local upstream = self:use_upstream_by_hash(cookie_val, failed_upstreams)
+    if upstream then
+      return upstream
     end
   end
 
   -- balancing by client IP is working only in 'persistent' mode currently
   if self.instance.map then -- is 'persistent' mode?
+    local route_param = get_param('lumetric-route')
+    if route_param then
+      local upstream = self:use_upstream_by_hash(route_param, failed_upstreams)
+      if upstream then
+        return upstream
+      end
+    end
+
+    local sticky_param = get_param('lumetric-sticky')
+    if sticky_param == 'off' or sticky_param == 'false' then
+      return self:use_new_upstream(failed_upstreams)
+    end
+
     local headers = ngx.req.get_headers()
     local real_ip = ngx.var.remote_addr
     for _, name in ipairs({ 'x-forwarded-for', 'x-real-ip', 'cf-connecting-ip' }) do
@@ -145,30 +191,50 @@ function _M.balance(self)
     end
 
     local req_key = (real_ip or '') .. "\t" .. (headers["user-agent"] or '')
-    local upstream_from_request = self.chash:find(req_key)
-    if can_use_upstream(self, upstream_from_request, failed_upstreams) then
-      local hash
-      for key, endpoint in pairs(self.instance.map) do
-        if endpoint == upstream_from_request then
-          hash = key
-          break
-        end
-      end
-      if hash and should_set_cookie(self) then
-        self:set_cookie(hash)
-      end
-      return upstream_from_request
+    local upstream = self:use_upstream_by_key(req_key, failed_upstreams)
+    if upstream then
+      return upstream
     end
   end
 
+  return self:use_new_upstream(failed_upstreams)
+end
+
+function _M.use_new_upstream(self, failed_upstreams)
   local new_upstream, hash = self:pick_new_upstream(failed_upstreams)
   if not new_upstream then
     ngx.log(ngx.WARN, string.format("failed to get new upstream; using upstream %s", new_upstream))
   elseif should_set_cookie(self) then
     self:set_cookie(hash)
   end
-
   return new_upstream
+end
+
+
+function _M.use_upstream_by_key(self, key, failed_upstreams)
+  local upstream = self.chash:find(key)
+  if can_use_upstream(self, upstream, failed_upstreams) then
+    for hash, endpoint in pairs(self.instance.map) do
+      if endpoint == upstream then
+        if should_set_cookie(self) then
+          self:set_cookie(hash)
+        end
+        return upstream
+      end
+    end
+  end
+  return nil
+end
+
+function _M.use_upstream_by_hash(self, hash, failed_upstreams)
+  local upstream = self.instance:find(hash)
+  if can_use_upstream(self, upstream, failed_upstreams) then
+    if should_set_cookie(self) then
+      self:set_cookie(hash)
+    end
+    return upstream
+  end
+  return nil
 end
 
 function _M.sync(self, backend)
